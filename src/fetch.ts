@@ -25,9 +25,18 @@ const USER_AGENT =
 
 const FETCH_TIMEOUT_MS = 15_000;
 
-// Per-domain delay tracking — polite rate limiting
-const _lastFetchByDomain = new Map<string, number>();
-const DOMAIN_DELAY_MS    = 2_000;   // 2s between requests to same domain
+// Per-domain delay tracking — polite rate limiting.
+//
+// Stores the *next available slot time* for each domain, not the last-fetch time.
+// This makes slot claiming an atomic (sync) read-modify-write, which is safe
+// under concurrent callers in JS's single-threaded event loop:
+//   Task A: reads slot=0, writes slot=now+2s, sleeps 0ms → fetches
+//   Task B: reads slot=now+2s, writes slot=now+4s, sleeps 2s → fetches
+//   Task C: reads slot=now+4s, writes slot=now+6s, sleeps 4s → fetches
+// Without this, a simple lastFetch+delay approach races when all concurrent
+// tasks read before any of them has written, bypassing the delay entirely.
+const _nextSlotByDomain = new Map<string, number>();
+const DOMAIN_DELAY_MS   = 2_000;   // 2s between requests to same domain
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -36,9 +45,16 @@ const DOMAIN_DELAY_MS    = 2_000;   // 2s between requests to same domain
 /**
  * Fetch a single job URL and return plain text.
  * Never throws — returns { status: "error" } on any failure.
+ *
+ * URL normalization: Dice `apply-redirect` URLs encode a base64 JSON payload
+ * containing the real `jobId`. We rewrite them to the canonical job-detail URL
+ * before fetching so the actual JD page is returned instead of a tiny redirect.
  */
 export async function fetchJobPage(url: string): Promise<FetchResult> {
   const fetched_at = new Date().toISOString();
+
+  // Normalize the URL first
+  url = normalizeDiceApplyRedirect(url);
 
   // Validate URL
   let parsed: URL;
@@ -238,14 +254,53 @@ async function _loadRobots(hostname: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// URL normalization
+// ---------------------------------------------------------------------------
+
+/**
+ * Dice programmatic job listings use apply-redirect URLs:
+ *   https://www.dice.com/apply-redirect?applyData=<base64>
+ * The base64 payload is JSON containing `jobId` — the real Dice job detail ID.
+ * Rewrite these to https://www.dice.com/job-detail/{jobId} so we fetch the
+ * actual JD page instead of the tiny ATS redirect response (~12 chars).
+ */
+function normalizeDiceApplyRedirect(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (
+      parsed.hostname === "www.dice.com" &&
+      parsed.pathname === "/apply-redirect"
+    ) {
+      const applyData = parsed.searchParams.get("applyData");
+      if (applyData) {
+        const json = JSON.parse(atob(applyData));
+        if (json?.jobId) {
+          return `https://www.dice.com/job-detail/${json.jobId}`;
+        }
+      }
+    }
+  } catch {
+    // Malformed URL or payload — fall through and fetch the original
+  }
+  return url;
+}
+
+// ---------------------------------------------------------------------------
 // Domain delay
 // ---------------------------------------------------------------------------
 
 async function _respectDomainDelay(hostname: string): Promise<void> {
-  const last = _lastFetchByDomain.get(hostname) ?? 0;
-  const wait = DOMAIN_DELAY_MS - (Date.now() - last);
+  const now      = Date.now();
+  const nextSlot = _nextSlotByDomain.get(hostname) ?? 0;
+
+  // Claim a slot synchronously — no await between read and write.
+  // JS single-threaded event loop guarantees this block runs to completion
+  // before any other concurrent caller can read the map.
+  const mySlot = Math.max(now, nextSlot);
+  _nextSlotByDomain.set(hostname, mySlot + DOMAIN_DELAY_MS);
+
+  const wait = mySlot - now;
   if (wait > 0) {
     await new Promise(resolve => setTimeout(resolve, wait));
   }
-  _lastFetchByDomain.set(hostname, Date.now());
 }
